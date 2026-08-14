@@ -1,0 +1,206 @@
+---
+- name: Create configuration backups using AAP
+  hosts: backup_targets
+  become: true
+  gather_facts: true
+  serial: 1
+
+  vars:
+    backup_root: /var/backups/ansible-config
+    backup_retention_days: 7
+
+    common_backup_paths:
+      - /etc/hosts
+      - /etc/fstab
+      - /etc/passwd
+      - /etc/group
+      - /etc/ssh/sshd_config
+
+    amazon_backup_paths:
+      - /etc/yum.conf
+      - /etc/dnf/dnf.conf
+
+    ubuntu_backup_paths:
+      - /etc/apt/sources.list
+      - /etc/apt/sources.list.d
+      - /etc/netplan
+
+  pre_tasks:
+    - name: Verify supported operating system
+      ansible.builtin.assert:
+        that:
+          - ansible_os_family in ["RedHat", "Debian"]
+        fail_msg: "Unsupported system: {{ ansible_distribution }}"
+
+    - name: Select Amazon Linux backup paths
+      ansible.builtin.set_fact:
+        selected_backup_paths: "{{ common_backup_paths + amazon_backup_paths }}"
+      when: ansible_os_family == "RedHat"
+
+    - name: Select Ubuntu backup paths
+      ansible.builtin.set_fact:
+        selected_backup_paths: "{{ common_backup_paths + ubuntu_backup_paths }}"
+      when: ansible_os_family == "Debian"
+
+    - name: Define backup information
+      ansible.builtin.set_fact:
+        backup_timestamp: >-
+          {{ ansible_date_time.date }}-{{ ansible_date_time.hour }}{{ ansible_date_time.minute }}{{ ansible_date_time.second }}
+
+    - name: Define backup filenames
+      ansible.builtin.set_fact:
+        backup_name: "{{ inventory_hostname }}-{{ backup_timestamp }}"
+        working_directory: >-
+          {{ backup_root }}/work-{{ inventory_hostname }}-{{ backup_timestamp }}
+        archive_path: >-
+          {{ backup_root }}/{{ inventory_hostname }}-{{ backup_timestamp }}.tar.gz
+        checksum_path: >-
+          {{ backup_root }}/{{ inventory_hostname }}-{{ backup_timestamp }}.tar.gz.sha256
+
+  tasks:
+    - name: Execute configuration backup
+      block:
+        - name: Create backup directory
+          ansible.builtin.file:
+            path: "{{ backup_root }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0700"
+
+        - name: Create temporary working directory
+          ansible.builtin.file:
+            path: "{{ working_directory }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0700"
+
+        - name: Check requested paths
+          ansible.builtin.stat:
+            path: "{{ item }}"
+          loop: "{{ selected_backup_paths }}"
+          register: checked_paths
+
+        - name: Build list of existing paths
+          ansible.builtin.set_fact:
+            existing_paths: >-
+              {{
+                checked_paths.results
+                | selectattr('stat.exists', 'equalto', true)
+                | map(attribute='item')
+                | list
+              }}
+
+        - name: Verify paths were found
+          ansible.builtin.assert:
+            that:
+              - existing_paths | length > 0
+            fail_msg: "No configuration paths were found."
+
+        - name: Copy configuration to working directory
+          ansible.builtin.command:
+            argv:
+              - cp
+              - -a
+              - --parents
+              - "{{ item }}"
+              - "{{ working_directory }}"
+          loop: "{{ existing_paths }}"
+          changed_when: true
+
+        - name: Create system information
+          ansible.builtin.copy:
+            content: |
+              Inventory name: {{ inventory_hostname }}
+              Hostname: {{ ansible_hostname }}
+              Distribution: {{ ansible_distribution }}
+              Version: {{ ansible_distribution_version }}
+              Kernel: {{ ansible_kernel }}
+              Backup time: {{ ansible_date_time.iso8601 }}
+            dest: "{{ working_directory }}/system-information.txt"
+            owner: root
+            group: root
+            mode: "0600"
+
+        - name: Create compressed archive
+          ansible.builtin.command:
+            argv:
+              - tar
+              - -czf
+              - "{{ archive_path }}"
+              - -C
+              - "{{ working_directory }}"
+              - .
+          changed_when: true
+
+        - name: Calculate archive checksum
+          ansible.builtin.stat:
+            path: "{{ archive_path }}"
+            checksum_algorithm: sha256
+          register: archive_information
+
+        - name: Verify archive
+          ansible.builtin.assert:
+            that:
+              - archive_information.stat.exists
+              - archive_information.stat.size | int > 0
+              - archive_information.stat.checksum | length > 0
+            fail_msg: "Archive validation failed."
+
+        - name: Create checksum file
+          ansible.builtin.copy:
+            content: "{{ archive_information.stat.checksum }}  {{ archive_path | basename }}\n"
+            dest: "{{ checksum_path }}"
+            owner: root
+            group: root
+            mode: "0600"
+
+        - name: Verify checksum on managed node
+          ansible.builtin.command:
+            argv:
+              - sha256sum
+              - -c
+              - "{{ checksum_path | basename }}"
+            chdir: "{{ backup_root }}"
+          register: checksum_result
+          changed_when: false
+
+        - name: Display backup result in AAP
+          ansible.builtin.debug:
+            msg:
+              - "Status: SUCCESS"
+              - "Target: {{ inventory_hostname }}"
+              - "Archive: {{ archive_path }}"
+              - "Size: {{ archive_information.stat.size }} bytes"
+              - "Checksum: {{ archive_information.stat.checksum }}"
+              - "Verification: {{ checksum_result.stdout }}"
+
+      rescue:
+        - name: Report backup failure
+          ansible.builtin.fail:
+            msg: "Configuration backup failed on {{ inventory_hostname }}."
+
+      always:
+        - name: Remove temporary working directory
+          ansible.builtin.file:
+            path: "{{ working_directory }}"
+            state: absent
+
+    - name: Find old backup archives
+      ansible.builtin.find:
+        paths: "{{ backup_root }}"
+        patterns:
+          - "*.tar.gz"
+          - "*.tar.gz.sha256"
+        file_type: file
+        age: "{{ backup_retention_days }}d"
+      register: old_backups
+
+    - name: Remove expired backups
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ old_backups.files }}"
+      loop_control:
+        label: "{{ item.path }}"
